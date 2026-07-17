@@ -145,24 +145,56 @@ AnalysisResult processBatch(
 AnalysisResult LogPipeline::run(const std::string& filename, ThreadPool& pool)
 {
     const size_t BATCH_SIZE = 200;
+    const size_t MAX_QUEUE = 10;
 
     std::vector<std::string> buffer;
     buffer.reserve(BATCH_SIZE);
 
-    std::vector<std::future<AnalysisResult>> futures;
+    std::deque<std::future<AnalysisResult>> futures;
+
+    AnalysisResult finalResult;
 
     bool firstLine = true;
 
-    // 🔥 берём безопасные "снимки" зависимостей
     LogSearch* parserPtr = parser.get();
-    LogFilter* filterPtr = filter.get();
-    std::set<std::string> keywordsCopy = keywords_;
+
+    // 🔥 забираем готовые задачи
+    auto drain_ready = [&]()
+        {
+            while (!futures.empty())
+            {
+                auto& f = futures.front();
+
+                if (f.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                    break;
+
+                finalResult.Merge(f.get());
+                futures.pop_front();
+            }
+        };
+
+    // 🔥 жёсткое ограничение
+    auto wait_slot = [&]()
+        {
+            while (futures.size() >= MAX_QUEUE)
+            {
+                // сначала пробуем не блокируясь
+                drain_ready();
+
+                if (futures.size() < MAX_QUEUE)
+                    break;
+
+                // иначе ждём первый
+                finalResult.Merge(futures.front().get());
+                futures.pop_front();
+            }
+        };
 
     source->ParseFile(filename, [&](const std::string& line)
         {
             if (firstLine && parserPtr->HasHeader())
             {
-                parserPtr->Init(line); // выполняется в одном потоке → ок
+                parserPtr->Init(line);
                 firstLine = false;
                 return;
             }
@@ -172,6 +204,8 @@ AnalysisResult LogPipeline::run(const std::string& filename, ThreadPool& pool)
 
             if (buffer.size() == BATCH_SIZE)
             {
+                wait_slot(); // 🔥 ограничение
+
                 auto batch = std::move(buffer);
                 buffer.clear();
 
@@ -204,9 +238,11 @@ AnalysisResult LogPipeline::run(const std::string& filename, ThreadPool& pool)
             }
         });
 
-    // 🔥 tail batch
+    // tail
     if (!buffer.empty())
     {
+        wait_slot();
+
         auto parserClone = std::shared_ptr<LogSearch>(parser->Clone());
         auto filterClone = std::shared_ptr<LogFilter>(filter->Clone());
         auto keywordsCopy = keywords_;
@@ -235,12 +271,11 @@ AnalysisResult LogPipeline::run(const std::string& filename, ThreadPool& pool)
         );
     }
 
-    // 🔥 reduce
-    AnalysisResult finalResult;
-
-    for (auto& f : futures)
+    // финальный drain
+    while (!futures.empty())
     {
-        finalResult.Merge(f.get());
+        finalResult.Merge(futures.front().get());
+        futures.pop_front();
     }
 
     return finalResult;
