@@ -219,8 +219,6 @@ if (ext == ".xml")
 
 ## 🚀 Возможные улучшения
 
-* streaming pipeline (Stage chain)
-* backpressure
 * top-K keywords
 * метрики (latency, throughput)
 * конфигурация через JSON/YAML
